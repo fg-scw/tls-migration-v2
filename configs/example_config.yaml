@@ -1,0 +1,34 @@
+# vmware2scw Configuration Example
+# Copy this file to migration.yaml and edit with your values
+
+vmware:
+  vcenter: vcenter.example.com
+  username: admin@vsphere.local
+  # Use password_env for security (reads from environment variable)
+  password_env: VCENTER_PASSWORD
+  # Or use password directly (not recommended for production)
+  # password: "your-password-here"
+  insecure: true  # Skip SSL cert verification (common with self-signed certs)
+
+scaleway:
+  access_key_env: SCW_ACCESS_KEY       # Environment variable for access key
+  secret_key_env: SCW_SECRET_KEY       # Environment variable for secret key
+  organization_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+  project_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+  default_zone: fr-par-1               # fr-par-1, fr-par-2, nl-ams-1, pl-waw-1, etc.
+  s3_region: fr-par                    # S3 region for object storage
+  s3_bucket: vmware-migration-transit  # Bucket for temporary qcow2 storage
+
+conversion:
+  work_dir: /var/lib/vmware2scw/work   # Temporary working directory
+  compress_qcow2: true                 # Compress output (smaller upload, slower conversion)
+  # virtio_win_iso: /path/to/virtio-win.iso  # Required for Windows VMs
+  cleanup_on_success: true             # Remove temp files after success
+  virt_v2v_verbose: false
+
+migration:
+  parallel_exports: 2                  # Max concurrent VMDK downloads
+  parallel_uploads: 3                  # Max concurrent S3 uploads
+  retry_count: 3                       # Retries for transient errors
+  retry_delay_seconds: 30              # Base delay between retries
+  export_strategy: local               # "local" (download+convert) or "streaming" (future)
