@@ -772,29 +772,22 @@ class MigrationPipeline:
         # Step 3: v2 merged Phase 2+3 — single QEMU boot with both controllers + serial monitoring
         logger.info("Windows Step 3/3: QEMU merged boot (pnputil + vioscsi PnP — v2)...")
         try:
-            from vmware2scw.converter.windows_virtio_v2 import (
-                _phase2_merged_qemu_boot,
-                SETUP_CMD_V2,
-            )
+            from vmware2scw.converter.windows_virtio_v2 import _phase2_merged_qemu_boot
 
-            # Upload v2 setup script (shutdown /s + serial output)
             p2_work = boot_disk.parent / "virtio-phase2"
             p2_work.mkdir(parents=True, exist_ok=True)
-            cmd_file = p2_work / "vmware2scw-setup-v2.cmd"
-            cmd_file.write_text(SETUP_CMD_V2, encoding="utf-8")
 
-            import os as _os
-            subprocess.run(
-                ["guestfish", "-a", str(boot_disk), "-i", "--",
-                 "upload", str(cmd_file), "/Windows/vmware2scw-setup.cmd"],
-                capture_output=True, text=True,
-                env={**_os.environ, "LIBGUESTFS_BACKEND": "direct"},
-            )
+            # FIX v3.2: Ne PAS re-uploader SETUP_CMD_V2 ici.
+            # _phase1_offline_v2 l'a déjà uploadé avec guestfish --rw (fix v2.1).
+            # Un re-upload ici avec guestfish -i (sans --rw) peut monter en read-only
+            # silencieusement sur NTFS dirty post-virt-v2v et écraser un fichier valide
+            # par un upload corrompu/ignoré.
 
             # Merged Phase 2+3 QEMU boot with serial monitoring
             phase_ok = _phase2_merged_qemu_boot(
                 str(boot_disk), p2_work, firmware=firmware
             )
+        
 
             if not phase_ok:
                 logger.warning("QEMU merged boot may have timed out — checking if drivers installed anyway")
@@ -1617,11 +1610,16 @@ cp {best_efi} /EFI/BOOT/BOOTX64.EFI
     def _fix_ntfs_dirty_flag(self, qcow2_path):
         """Fix NTFS dirty flag that prevents write access.
 
+        FIX v3.2: Utilise un nbd device unique par migration basé sur un hash
+        du path qcow2, pour éviter les collisions entre migrations parallèles
+        qui utilisaient toutes /dev/nbd0 simultanément.
+
         Windows Hibernation and Fast Startup leave the NTFS filesystem in a
         'dirty' state. virt-v2v and guestfish will refuse to mount read-write.
 
         Uses qemu-nbd + host ntfsfix for maximum reliability.
         """
+        import hashlib
         import os
         import subprocess
         import time
@@ -1629,10 +1627,16 @@ cp {best_efi} /EFI/BOOT/BOOTX64.EFI
         logger.info("Checking/fixing NTFS dirty flag (Fast Startup / Hibernation)...")
         gf_env = {**os.environ, "LIBGUESTFS_BACKEND": "direct"}
 
+        # FIX v3.2: nbd device unique par path pour éviter les collisions
+        # entre migrations parallèles (toutes utilisaient /dev/nbd0 avant)
+        idx = int(hashlib.md5(str(qcow2_path).encode()).hexdigest(), 16) % 8 + 1
+        nbd_dev = f"/dev/nbd{idx}"
+        logger.info(f"  Using nbd device: {nbd_dev} (unique per qcow2 path, avoids parallel collisions)")
+
         # Method 1: qemu-nbd + ntfsfix (most reliable)
-        nbd_dev = "/dev/nbd0"
         subprocess.run(["modprobe", "nbd", "max_part=8"], capture_output=True)
         subprocess.run(["qemu-nbd", "--disconnect", nbd_dev], capture_output=True)
+        time.sleep(0.5)
 
         r = subprocess.run(
             ["qemu-nbd", "--connect", nbd_dev, str(qcow2_path)],
@@ -1661,8 +1665,9 @@ cp {best_efi} /EFI/BOOT/BOOTX64.EFI
                             logger.warning(f"  ntfsfix on {part}: {fix_r.stderr.strip()[:200]}")
             finally:
                 subprocess.run(["qemu-nbd", "--disconnect", nbd_dev], capture_output=True)
+                time.sleep(0.5)
         else:
-            logger.warning(f"  qemu-nbd not available: {r.stderr.strip()[:200]}")
+            logger.warning(f"  qemu-nbd not available on {nbd_dev}: {r.stderr.strip()[:200]}")
 
         # Method 2: Disable Fast Startup via hivex
         try:
