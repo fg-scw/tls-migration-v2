@@ -145,17 +145,8 @@ class VMJob:
             "completed_at": self.completed_at,
             "completed_stages": self.completed_stages,
             "stage_timings": self.stage_timings,
-            # FIX v4.1: Inclure tous les artifacts nécessaires au resume.
-            # Avant ce fix, seuls scaleway_image_id/instance_id/s3_keys étaient
-            # sauvegardés. Au resume après échec import_scw, s3_bucket était absent
-            # → KeyError: 's3_bucket' dans _stage_import_scw.
             "artifacts": {k: v for k, v in self.artifacts.items()
-                          if k in (
-                              "scaleway_image_id", "scaleway_instance_id",
-                              "s3_keys", "s3_bucket",          # ← nécessaires pour resume import_scw
-                              "scaleway_snapshot_id", "scaleway_snapshot_ids",
-                              "qcow2_paths", "vm_info",         # ← nécessaires pour resume upload_s3
-                          )},
+                          if k in ("scaleway_image_id", "scaleway_instance_id", "s3_keys")},
         }
 
 
@@ -267,17 +258,11 @@ class SemaphoreManager:
         max_disk_io: int = 3,
         max_s3_upload: int = 6,
         max_scw_api: int = 5,
-        max_qemu: int = 1,
     ):
         self._global = asyncio.Semaphore(max_global)
         self._disk_io = asyncio.Semaphore(max_disk_io)
         self._s3_upload = asyncio.Semaphore(max_s3_upload)
         self._scw_api = asyncio.Semaphore(max_scw_api)
-        # FIX v4.1: Semaphore QEMU dédié — limite à 1 QEMU simultané par défaut.
-        # Deux instances QEMU concurrentes (inject_virtio + ensure_uefi de VMs différentes)
-        # consomment 2×4GB RAM + contention KVM → timeouts sur les deux.
-        # Avec max_qemu=1, le second QEMU attend la fin du premier avant de démarrer.
-        self._qemu = asyncio.Semaphore(max_qemu)
         self._max_per_host = max_per_host
         self._host_semaphores: dict[str, asyncio.Semaphore] = {}
 
@@ -301,17 +286,6 @@ class SemaphoreManager:
     @property
     def scw_api(self) -> asyncio.Semaphore:
         return self._scw_api
-
-    @property
-    def qemu_sem(self) -> asyncio.Semaphore:
-        """Semaphore dédié aux stages qui lancent QEMU.
-
-        inject_virtio et ensure_uefi (bcdboot) bootent chacun une VM QEMU avec
-        4GB RAM + KVM. Limiter à 1 simultané évite la contention RAM/KVM qui
-        provoque des timeouts sur le second QEMU (symptôme observé sur WIN2019-AD).
-        Configurable via plan.yaml: concurrency.max_concurrent_qemu (défaut: 1).
-        """
-        return self._qemu
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -426,9 +400,6 @@ class BatchOrchestrator:
             max_disk_io=concurrency.max_concurrent_conversions if concurrency else 3,
             max_s3_upload=concurrency.max_concurrent_uploads if concurrency else 6,
             max_scw_api=concurrency.max_concurrent_imports if concurrency else 5,
-            # FIX v4.1: max_qemu=1 par défaut — serialise les boots QEMU
-            # (inject_virtio + ensure_uefi) pour éviter contention RAM/KVM.
-            max_qemu=getattr(concurrency, 'max_concurrent_qemu', 1) if concurrency else 1,
         )
 
         self._cancel_event = asyncio.Event()
@@ -721,19 +692,11 @@ class BatchOrchestrator:
                 job.os_family = "linux"
 
     def _get_stage_semaphore(self, job: VMJob, stage: str) -> asyncio.Semaphore | None:
-        """Get the appropriate semaphore for a pipeline stage.
-
-        FIX v4.1: inject_virtio et ensure_uefi lancent QEMU → qemu_sem (max=1).
-        Avant ce fix, ils utilisaient disk_io (max=3) ce qui permettait deux
-        QEMU simultanés → contention RAM/KVM → timeouts.
-        fix_bootloader ne lance pas QEMU → disk_io suffit.
-        """
+        """Get the appropriate semaphore for a pipeline stage."""
         if stage in ("export", "snapshot"):
             return self.semaphores.get_host_semaphore(job.esxi_host or "default")
-        if stage in ("inject_virtio", "ensure_uefi"):
-            # Ces stages lancent QEMU (4GB RAM + KVM chacun) — serialiser
-            return self.semaphores.qemu_sem
-        if stage in ("convert", "adapt_guest", "clean_tools", "fix_bootloader"):
+        if stage in ("convert", "adapt_guest", "clean_tools", "inject_virtio",
+                      "fix_bootloader", "ensure_uefi"):
             return self.semaphores.disk_io
         if stage == "upload_s3":
             return self.semaphores.s3_upload
